@@ -17,6 +17,10 @@
 (define-constant err-company-not-found (err u112))
 (define-constant err-exercise-expired (err u113))
 (define-constant err-invalid-price (err u114))
+(define-constant err-listing-not-found (err u115))
+(define-constant err-self-purchase (err u116))
+(define-constant err-listing-expired (err u117))
+(define-constant err-insufficient-payment (err u118))
 
 (define-constant blocks-per-month u4320)
 (define-constant blocks-per-year u52560)
@@ -26,6 +30,7 @@
 (define-data-var grant-id-nonce uint u1)
 (define-data-var total-shares-outstanding uint u0)
 (define-data-var company-valuation uint u0)
+(define-data-var listing-id-nonce uint u1)
 
 (define-map stock-grants uint {
     employee: principal,
@@ -76,6 +81,16 @@
     department: (string-ascii 30),
     role: (string-ascii 50),
     performance-rating: uint,
+    is-active: bool
+})
+
+(define-map market-listings uint {
+    listing-id: uint,
+    seller: principal,
+    grant-id: uint,
+    amount: uint,
+    price-per-option: uint,
+    expiry-block: uint,
     is-active: bool
 })
 
@@ -340,4 +355,88 @@
 
 (define-read-only (get-total-shares)
   (ok (var-get total-shares-outstanding)))
+
+(define-public (create-market-listing
+    (grant-id uint)
+    (amount uint)
+    (price-per-option uint)
+    (expiry-blocks uint))
+  (let (
+    (listing-id (var-get listing-id-nonce))
+    (grant (unwrap! (map-get? stock-grants grant-id) err-grant-not-found))
+    (vested-amount (unwrap! (calculate-vested grant-id) err-nothing-vested))
+    (available (- vested-amount (get claimed-amount grant))))
+    
+    (asserts! (is-eq tx-sender (get employee grant)) err-not-authorized)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (<= amount available) err-insufficient-balance)
+    (asserts! (> price-per-option u0) err-invalid-price)
+    (asserts! (> expiry-blocks u0) err-invalid-amount)
+    
+    (map-set market-listings listing-id {
+        listing-id: listing-id,
+        seller: tx-sender,
+        grant-id: grant-id,
+        amount: amount,
+        price-per-option: price-per-option,
+        expiry-block: (+ stacks-block-height expiry-blocks),
+        is-active: true
+    })
+    
+    (var-set listing-id-nonce (+ listing-id u1))
+    (ok listing-id)))
+
+(define-public (purchase-from-market (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? market-listings listing-id) err-listing-not-found))
+    (grant-id (get grant-id listing))
+    (grant (unwrap! (map-get? stock-grants grant-id) err-grant-not-found))
+    (vested-amount (unwrap! (calculate-vested grant-id) err-nothing-vested))
+    (available (- vested-amount (get claimed-amount grant)))
+    (total-cost (* (get amount listing) (get price-per-option listing))))
+    
+    (asserts! (get is-active listing) err-listing-not-found)
+    (asserts! (< stacks-block-height (get expiry-block listing)) err-listing-expired)
+    (asserts! (not (is-eq tx-sender (get seller listing))) err-self-purchase)
+    (asserts! (<= (get amount listing) available) err-insufficient-balance)
+    
+    (try! (stx-transfer? total-cost tx-sender (get seller listing)))
+    (try! (ft-transfer? company-equity (get amount listing) contract-owner tx-sender))
+    
+    (map-set stock-grants grant-id
+        (merge grant {
+            claimed-amount: (+ (get claimed-amount grant) (get amount listing))
+        }))
+    
+    (map-set market-listings listing-id
+        (merge listing {
+            is-active: false
+        }))
+    
+    (let ((seller-data (unwrap! (map-get? employee-grants (get seller listing)) err-grant-not-found)))
+        (map-set employee-grants (get seller listing)
+            (merge seller-data {
+                total-exercised: (+ (get total-exercised seller-data) (get amount listing))
+            })))
+    
+    (ok (get amount listing))))
+
+(define-public (cancel-market-listing (listing-id uint))
+  (let ((listing (unwrap! (map-get? market-listings listing-id) err-listing-not-found)))
+    
+    (asserts! (is-eq tx-sender (get seller listing)) err-not-authorized)
+    (asserts! (get is-active listing) err-listing-not-found)
+    
+    (map-set market-listings listing-id
+        (merge listing {
+            is-active: false
+        }))
+    
+    (ok true)))
+
+(define-read-only (get-market-listing (listing-id uint))
+  (map-get? market-listings listing-id))
+
+(define-read-only (get-active-listings-count)
+  (ok (var-get listing-id-nonce)))
 
